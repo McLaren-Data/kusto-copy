@@ -181,7 +181,7 @@ DataByExtent
                             (long)r["RowCount"],
                             (string)r["MinIngestionTime"],
                             (string)r["MaxIngestionTime"],
-                            (DateTime?)r["CreatedOn"]))
+                            r["CreatedOn"] is DBNull ? null : (DateTime?)r["CreatedOn"]))
                         .ToImmutableArray();
 
                     return results;
