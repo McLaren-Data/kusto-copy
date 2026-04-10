@@ -155,6 +155,7 @@ let DataByExtent = BaseData
     | lookup kind=leftouter ExtentIdCreationTime on ExtentId
     | summarize RowCount=sum(RowCount), MinIngestionTime=min(MinIngestionTime), MaxIngestionTime=max(MaxIngestionTime), CreatedOn=max(CreatedOn)
         by PartitionBin
+    | extend CreatedOn = coalesce(CreatedOn, todatetime(MaxIngestionTime))
     | order by MinIngestionTime asc
     | extend MinIngestionTime=tostring(MinIngestionTime)
     | extend MaxIngestionTime=tostring(MaxIngestionTime)
@@ -181,7 +182,7 @@ DataByExtent
                             (long)r["RowCount"],
                             (string)r["MinIngestionTime"],
                             (string)r["MaxIngestionTime"],
-                            (DateTime?)r["CreatedOn"]))
+                            r["CreatedOn"] as DateTime?))
                         .ToImmutableArray();
 
                     return results;
