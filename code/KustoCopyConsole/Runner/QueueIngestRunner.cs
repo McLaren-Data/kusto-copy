@@ -1,7 +1,6 @@
 ﻿using KustoCopyConsole.Entity;
 using KustoCopyConsole.Entity.State;
 using KustoCopyConsole.Kusto;
-using System.Collections.Immutable;
 using System.Linq;
 
 namespace KustoCopyConsole.Runner
@@ -31,11 +30,11 @@ namespace KustoCopyConsole.Runner
                 .OrderBy(b => b.BlockKey.IterationKey.IterationId)
                 .ThenBy(b => b.BlockKey.BlockId)
                 .Take(BATCH_BLOCKS)
-                .ToImmutableArray();
+                .ToArray();
 
             if (blocks.Length > 0)
             {
-                var destinationTable = Parameterization.Activities[activityName]
+                var destinationTable = Parameterization.GetActivity(activityName)
                     .GetDestinationTableIdentity();
                 var iterationKey = blocks[0].BlockKey.IterationKey;
                 var tempTable = TryGetTempTable(iterationKey);
@@ -45,7 +44,7 @@ namespace KustoCopyConsole.Runner
                     //  Filter blocks with given iteration key
                     blocks = blocks
                         .Where(b => b.BlockKey.IterationKey == iterationKey)
-                        .ToImmutableArray();
+                        .ToArray();
 
                     var ingestClient = DbClientFactory.GetIngestClient(
                         destinationTable.ClusterUri,
@@ -56,7 +55,7 @@ namespace KustoCopyConsole.Runner
                             u => u.BlockKey.BlockId,
                             blocks.Select(b => b.BlockKey.BlockId)))
                         .GroupBy(u => u.BlockKey.BlockId)
-                        .ToImmutableDictionary(g => g.Key, g => g.ToImmutableArray());
+                        .ToDictionary(g => g.Key, g => g.ToArray());
                     var tasks = blocks
                         .Select(b => QueueIngestBlockAsync(
                             b,
@@ -64,7 +63,7 @@ namespace KustoCopyConsole.Runner
                             ingestClient,
                             tempTable.TempTableName,
                             ct))
-                        .ToImmutableArray();
+                        .ToArray();
 
                     await Task.WhenAll(tasks);
 
@@ -86,13 +85,13 @@ namespace KustoCopyConsole.Runner
             //  Get Uri with SAS tokens
             var authorizedUriTasks = urlRecords
                 .Select(u => StagingBlobUriProvider.AuthorizeUriAsync(u.Url, ct))
-                .ToImmutableArray();
+                .ToArray();
 
             await Task.WhenAll(authorizedUriTasks);
 
             var authorizedUris = authorizedUriTasks
                 .Select(t => t.Result)
-                .ToImmutableList();
+                .ToArray();
             //  Queue all blobs
             var operationTexts = await ingestClient.QueueBlobsAsync(
                 new KustoPriority(block.BlockKey),

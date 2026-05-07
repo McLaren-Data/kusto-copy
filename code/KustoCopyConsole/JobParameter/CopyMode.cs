@@ -1,9 +1,9 @@
 ﻿namespace KustoCopyConsole.JobParameter
 {
-    public enum ExportMode
+    public enum CopyMode
     {
         BackfillOnly,
-        NewOnly,
-        BackfillAndNew
+        BackfillAndNew,
+        NewOnly
     }
 }

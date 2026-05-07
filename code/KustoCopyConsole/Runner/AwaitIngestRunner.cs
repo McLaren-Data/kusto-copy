@@ -20,15 +20,17 @@ namespace KustoCopyConsole.Runner
         protected override async Task RunActivityAsync(string activityName, CancellationToken ct)
         {
             var destinationTable =
-                Parameterization.Activities[activityName].GetDestinationTableIdentity();
+                Parameterization.GetActivity(activityName).GetDestinationTableIdentity();
             var dbClient = DbClientFactory.GetDbCommandClient(
                 destinationTable.ClusterUri,
                 destinationTable.DatabaseName);
             var iterationKeys = Database.Iterations.Query()
                 .Where(pf => pf.Equal(i => i.IterationKey.ActivityName, activityName))
                 .Where(pf => pf.In(i => i.State, [IterationState.Planning, IterationState.Planned]))
+                .OrderBy(i => i.IterationKey.IterationId)
+                .ThenBy(i => i.IterationKey.ActivityName)
                 .Select(i => i.IterationKey)
-                .ToImmutableArray();
+                .ToArray();
 
             foreach (var iterationKey in iterationKeys)
             {
@@ -115,7 +117,7 @@ namespace KustoCopyConsole.Runner
                 .Where(pf => pf.Equal(b => b.State, BlockState.Queued))
                 .OrderBy(b => b.BlockKey.BlockId)
                 .Take(MAX_BLOCK_INGESTED_COUNT)
-                .ToImmutableArray();
+                .ToArray();
 
             if (queuedBlocks.Length > 0)
             {
@@ -126,7 +128,7 @@ namespace KustoCopyConsole.Runner
                     tempTableName,
                     ct);
 
-                if (tagRowCounts.Any())
+                if (tagRowCounts.Count > 0)
                 {
                     var queuedBlocksByTags = queuedBlocks.ToImmutableDictionary(b => b.BlockTag);
                     var overIngestedBlocks = tagRowCounts
@@ -184,7 +186,7 @@ namespace KustoCopyConsole.Runner
                     destinationTable.DatabaseName);
                 var ingestionBatches = Database.IngestionBatches.Query()
                     .Where(pf => pf.Equal(b => b.BlockKey, oldestQueuedBlock.BlockKey))
-                    .ToImmutableArray();
+                    .ToArray();
 
                 foreach (var batch in ingestionBatches)
                 {

@@ -43,14 +43,20 @@ namespace KustoCopyConsole.Entity
                 TypedTableSchema<ActivityRecord>.FromConstructor(ACTIVITY_TABLE)
                 .AddPrimaryKeyProperty(a => a.ActivityName),
                 TypedTableSchema<IterationRecord>.FromConstructor(ITERATION_TABLE)
-                .AddPrimaryKeyProperty(i => i.IterationKey),
+                .AddPrimaryKeyProperty(i => i.IterationKey)
+                .AddTrigger((db, tx) =>
+                {
+                    var typedDb = (TrackDatabase)db;
+
+                    IterationToBlockMetric(typedDb, tx);
+                }),
                 TypedTableSchema<BlockRecord>.FromConstructor(BLOCK_TABLE)
                 .AddPrimaryKeyProperty(b => b.BlockKey)
                 .AddTrigger((db, tx) =>
                 {
                     var typedDb = (TrackDatabase)db;
 
-                    ComputeBlockMetric(typedDb, tx);
+                    BlockToBlockMetric(typedDb, tx);
                 })
                 .OptOutIndex(b => b.IngestionTimeStart)
                 .OptOutIndex(b => b.IngestionTimeEnd)
@@ -63,6 +69,12 @@ namespace KustoCopyConsole.Entity
                 .OptOutIndex(p => p.MinIngestionTime)
                 .OptOutIndex(p => p.MaxIngestionTime)
                 .OptOutIndex(p => p.RowCount)
+                .AddTrigger((db, tx) =>
+                {
+                    var typedDb = (TrackDatabase)db;
+
+                    PlanningPartitionToBlockMetric(typedDb, tx);
+                })
                 ,
                 TypedTableSchema<TempTableRecord>.FromConstructor(TEMP_TABLE_TABLE)
                 .AddPrimaryKeyProperty(t => t.IterationKey),
@@ -147,7 +159,8 @@ namespace KustoCopyConsole.Entity
             return sumValue;
         }
 
-        private static void ComputeBlockMetric(TrackDatabase db, TransactionContext tx)
+        #region Triggers
+        private static void BlockToBlockMetric(TrackDatabase db, TransactionContext tx)
         {
             var newBlocks = db.Blocks.Query(tx)
                 .WithinTransactionOnly();
@@ -160,37 +173,20 @@ namespace KustoCopyConsole.Entity
                     b.BlockKey.IterationKey,
                     ToBlockMetric(b.State),
                     1));
-            var newBlocksPlannedRowMetrics = newBlocks
+            var newBlocksMovedRowMetrics = newBlocks
+                .Where(b => b.State == BlockState.ExtentMoved)
                 .Select(b => new BlockMetricRecord(
                     b.BlockKey.IterationKey,
-                    BlockMetric.PlannedRowCount,
-                    b.PlannedRowCount));
-            var newBlocksExportedRowMetrics = newBlocks
-                .Select(b => new BlockMetricRecord(
-                    b.BlockKey.IterationKey,
-                    BlockMetric.ExportedRowCount,
+                    BlockMetric.MovedRowCount,
                     b.ExportedRowCount));
             var deletedStateMetrics = deletedBlocks
                 .Select(b => new BlockMetricRecord(
                     b.BlockKey.IterationKey,
                     ToBlockMetric(b.State),
                     -1));
-            var deletedPlannedRowMetrics = deletedBlocks
-                .Select(b => new BlockMetricRecord(
-                    b.BlockKey.IterationKey,
-                    BlockMetric.PlannedRowCount,
-                    -b.PlannedRowCount));
-            var deletedExportedRowMetrics = deletedBlocks
-                .Select(b => new BlockMetricRecord(
-                    b.BlockKey.IterationKey,
-                    BlockMetric.ExportedRowCount,
-                    -b.ExportedRowCount));
             var newMetrics = newBlocksStateMetrics
-                .Concat(newBlocksExportedRowMetrics)
-                .Concat(newBlocksPlannedRowMetrics)
+                .Concat(newBlocksMovedRowMetrics)
                 .Concat(deletedStateMetrics)
-                .Concat(deletedExportedRowMetrics)
-                .Concat(deletedPlannedRowMetrics)
                 .GroupBy(bm => new
                 {
                     bm.IterationKey,
@@ -203,6 +199,34 @@ namespace KustoCopyConsole.Entity
 
             db.BlockMetrics.AppendRecords(newMetrics, tx);
         }
+
+        private static void PlanningPartitionToBlockMetric(TrackDatabase db, TransactionContext tx)
+        {
+            var newPlanningPartitions = db.PlanningPartitions.Query(tx)
+                .WithinTransactionOnly();
+            var newTotalPlannedRowCountMetrics = newPlanningPartitions
+                .Where(pf => pf.Equal(p => p.PartitionId, 0))
+                .Select(p => new BlockMetricRecord(
+                    p.IterationKey,
+                    BlockMetric.TotalPlannedRowCount,
+                    p.RowCount));
+
+            db.BlockMetrics.AppendRecords(newTotalPlannedRowCountMetrics, tx);
+        }
+
+        private static void IterationToBlockMetric(TrackDatabase db, TransactionContext tx)
+        {
+            var deletedIterations = db.Iterations.TombstonedWithinTransaction(tx)
+                .ToArray();
+
+            foreach (var iteration in deletedIterations)
+            {
+                db.BlockMetrics.Query(tx)
+                    .Where(pf => pf.Equal(i => i.IterationKey, iteration.IterationKey))
+                    .Delete();
+            }
+        }
+        #endregion
 
         private static BlockMetric ToBlockMetric(BlockState state)
         {   //  Assume the state and metrics are in the same order and states appear first

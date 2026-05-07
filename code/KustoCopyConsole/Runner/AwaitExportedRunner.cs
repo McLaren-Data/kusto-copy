@@ -1,219 +1,94 @@
 ﻿using KustoCopyConsole.Entity;
 using KustoCopyConsole.Entity.State;
+using KustoCopyConsole.JobParameter;
 using KustoCopyConsole.Kusto;
 using KustoCopyConsole.Kusto.Data;
 using System;
 using System.Collections.Immutable;
-using System.Diagnostics;
 using System.Linq;
 
 namespace KustoCopyConsole.Runner
 {
-    internal class AwaitExportedRunner : RunnerBase
+    internal class AwaitExportedRunner : AwaitCommandRunner
     {
-        private const int MAX_OPERATIONS = 200;
-        private static readonly IImmutableSet<string> FAILED_STATUS =
-            ImmutableHashSet.Create(
-                [
-                "Throttled",
-                "Failed",
-                "PartiallySucceeded",
-                "Abandoned",
-                "BadInput",
-                "Canceled",
-                "Skipped"
-                ]);
-
         public AwaitExportedRunner(RunnerParameters parameters)
            : base(parameters, TimeSpan.FromSeconds(10))
         {
         }
 
-        public async Task RunAsync(CancellationToken ct)
-        {
-            while (!AreActivitiesCompleted())
-            {
-                var activityNames = Database.Activities.Query()
-                    .Where(pf => pf.NotEqual(a => a.State, ActivityState.Completed))
-                    .Select(a => a.ActivityName)
-                    .ToHashSet();
-                var tasks = Parameterization.Activities.Values
-                    .Where(a => activityNames.Contains(a.ActivityName))
-                    .GroupBy(a => a.GetSourceTableIdentity().ClusterUri)
-                    .Select(g => Task.Run(() => RunActivitiesAsync(
-                        g.Key,
-                        g.Select(a => a.ActivityName).ToImmutableArray(),
-                        ct)))
-                    .ToImmutableList();
+        protected override BlockState InitialState => BlockState.Exporting;
 
-                await Task.WhenAll(tasks);
-                await SleepAsync(ct);
-            }
+        protected override BlockState ResetState => BlockState.Planned;
+
+        protected override Uri GetClusterUri(ActivityParameterization activity)
+            => activity.GetSourceTableIdentity().ClusterUri;
+
+        protected override BlockRecord ResetBlock(BlockRecord block)
+        {
+            return block with { ExportOperationId = string.Empty };
         }
 
-        private async Task RunActivitiesAsync(
-            Uri sourceClusterUri,
-            IImmutableList<string> activityNames,
+        protected override string GetOperationId(BlockRecord block)
+        {
+            return block.ExportOperationId;
+        }
+
+        protected override async Task ProcessOperationAsync(
+            IEnumerable<BlockRecord> blocks,
+            ActivityParameterization activityParam,
             CancellationToken ct)
         {
-            var blockRecords = Database.Blocks.Query()
-                .Where(pf => pf.In(b => b.BlockKey.IterationKey.ActivityName, activityNames))
-                .Where(pf => pf.Equal(b => b.State, BlockState.Exporting))
-                .Take(MAX_OPERATIONS)
-                .ToImmutableArray();
-
-            if (blockRecords.Length > 0)
-            {
-                await UpdateOperationsAsync(sourceClusterUri, blockRecords, ct);
-            }
-        }
-
-        private async Task UpdateOperationsAsync(
-            Uri clusterUri,
-            IEnumerable<BlockRecord> blockRecords,
-            CancellationToken ct)
-        {
-            var dbClient = DbClientFactory.GetDbCommandClient(clusterUri, string.Empty);
-            var operationIdMap = blockRecords
-                .ToImmutableDictionary(b => b.ExportOperationId);
-            var statuses = await dbClient.ShowOperationsAsync(
-                KustoPriority.HighestPriority,
-                operationIdMap.Keys,
-                ct);
-
-            DetectLostOperationIds(operationIdMap, statuses);
-            DetectFailures(operationIdMap, statuses);
-            await CompleteOperationsAsync(operationIdMap, statuses, ct);
-        }
-
-        #region Handle Operations
-        private void DetectLostOperationIds(
-            IImmutableDictionary<string, BlockRecord> operationIdMap,
-            IImmutableList<ExportOperationStatus> status)
-        {
-            var statusOperationIdBag = status
-                .Select(s => s.OperationId)
-                .ToHashSet();
-
-            foreach (var id in operationIdMap.Keys)
-            {
-                if (!statusOperationIdBag.Contains(id))
-                {
-                    var block = operationIdMap[id];
-
-                    Database.Blocks.UpdateRecord(
-                        block,
-                        block with
-                        {
-                            ExportOperationId = string.Empty,
-                            State = BlockState.Planned
-                        });
-                    TraceWarning(
-                        $"Warning!  Operation ID lost:  '{id}' for " +
-                        $"block {block.BlockKey} ; block marked for reprocessing");
-                }
-            }
-        }
-
-        private void DetectFailures(
-            IImmutableDictionary<string, BlockRecord> operationIdMap,
-            IImmutableList<ExportOperationStatus> statuses)
-        {
-            var failedStatuses = statuses
-                .Where(s => FAILED_STATUS.Contains(s.State));
-
-            foreach (var status in failedStatuses)
-            {
-                var block = operationIdMap[status.OperationId];
-                var message = status.ShouldRetry
-                    ? "block marked for reprocessing"
-                    : "block can't be re-exported";
-                var warning = $"Warning!  Operation ID in state '{status.State}', " +
-                    $"status '{status.Status}' " +
-                    $"block {block.BlockKey} ; {message}";
-
-                TraceWarning(warning);
-                if (status.ShouldRetry)
-                {
-                    Database.Blocks.UpdateRecord(
-                        block,
-                        block with
-                        {
-                            ExportOperationId = string.Empty,
-                            State = BlockState.Planned
-                        });
-                }
-                else
-                {
-                    throw new CopyException($"Permanent export error", false);
-                }
-            }
-        }
-
-        private async Task CompleteOperationsAsync(
-            IImmutableDictionary<string, BlockRecord> operationIdMap,
-            IImmutableList<ExportOperationStatus> statuses,
-            CancellationToken ct)
-        {
-            var tasks = statuses
-                .Where(s => s.State == "Completed")
-                .Select(s => ProcessOperationAsync(s, operationIdMap[s.OperationId], ct))
-                .ToImmutableArray();
-
-            await Task.WhenAll(tasks);
-        }
-
-        private async Task ProcessOperationAsync(
-            ExportOperationStatus status,
-            BlockRecord block,
-            CancellationToken ct)
-        {
-            var activityParam = Parameterization.Activities[block.BlockKey.IterationKey.ActivityName];
-            var sourceTable = activityParam.GetSourceTableIdentity();
+            var iterationKey = blocks.First().BlockKey.IterationKey;
+            var tableId = activityParam.GetSourceTableIdentity();
             var dbClient = DbClientFactory.GetDbCommandClient(
-                sourceTable.ClusterUri,
-                sourceTable.DatabaseName);
-            var details = await dbClient.ShowExportDetailsAsync(
-                new KustoPriority(block.BlockKey),
-                status.OperationId,
-                ct);
-            var urls = details
-                .Select(d => new BlobUrlRecord(
-                    block.BlockKey,
-                    d.BlobUri,
-                    d.RecordCount))
-                .ToImmutableArray();
+                tableId.ClusterUri,
+                tableId.DatabaseName);
+            var taskBundles = blocks
+                .Select(b => new
+                {
+                    Block = b,
+                    DetailTask = dbClient.ShowExportDetailsAsync(
+                        new KustoPriority(b.BlockKey),
+                        b.ExportOperationId,
+                        ct)
+                })
+                .ToArray();
 
-            if (urls.Length > 0)
-            {
-                var newBlock = block with
+            await Task.WhenAll(taskBundles.Select(b => b.DetailTask));
+
+            var newBlocks = taskBundles
+                .Select(tb => tb.DetailTask.Result.Count > 0
+                ? tb.Block with
                 {
                     State = BlockState.Exported,
                     ExportOperationId = string.Empty,
-                    ExportedRowCount = details.Sum(d => d.RecordCount)
-                };
-
-                Trace.TraceInformation($"Exported block {block.BlockKey}:  {urls.Count()} urls");
-                using (var tx = Database.CreateTransaction())
-                {
-                    Database.Blocks.UpdateRecord(block, newBlock, tx);
-                    Database.BlobUrls.AppendRecords(urls, tx);
-
-                    tx.Complete();
+                    ExportedRowCount = tb.DetailTask.Result.Sum(d => d.RecordCount)
                 }
-            }
-            else
+                : tb.Block with
+                {
+                    ExportOperationId = string.Empty,
+                    State = BlockState.ExtentMoved,
+                    ExportedRowCount = 0
+                });
+            var newUrls = taskBundles
+                .SelectMany(tb => tb.DetailTask.Result.Select(d => new BlobUrlRecord(
+                    tb.Block.BlockKey,
+                    d.BlobUri,
+                    d.RecordCount)));
+
+            using (var tx = Database.CreateTransaction())
             {
-                Database.Blocks.UpdateRecord(
-                    block,
-                    block with
-                    {
-                        ExportOperationId = string.Empty,
-                        State = BlockState.ExtentMoved,
-                        ExportedRowCount = 0
-                    });
+                Database.Blocks.Query(tx)
+                    .Where(pf => pf.Equal(b => b.BlockKey.IterationKey, iterationKey))
+                    .Where(pf => pf.In(
+                        b => b.BlockKey.BlockId,
+                        blocks.Select(b => b.BlockKey.BlockId)))
+                    .Delete();
+                Database.Blocks.AppendRecords(newBlocks, tx);
+                Database.BlobUrls.AppendRecords(newUrls, tx);
+
+                tx.Complete();
             }
         }
-        #endregion
     }
 }
